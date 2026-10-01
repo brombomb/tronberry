@@ -412,6 +412,14 @@ int main(int argc, char *argv[]) {
   runtime_options.drop_privileges = true;
 
   bool enable_startup_sound = true;
+  if (const char *env = getenv("TRONBERRY_NO_STARTUP_SOUND");
+      env && *env && strcmp(env, "0") != 0) {
+    enable_startup_sound = false;
+  }
+  if (const char *env = getenv("TRONBERRY_STARTUP_SOUND");
+      env && strcmp(env, "0") == 0) {
+    enable_startup_sound = false;
+  }
   std::vector<char *> new_argv(argv, argv + argc);
   for (auto it = new_argv.begin() + 1; it != new_argv.end();) {
     if (strcmp(*it, "--verbose") == 0) {
@@ -554,6 +562,7 @@ int main(int argc, char *argv[]) {
             client_info["mac"] = get_mac_address();
             client_info["hostname"] = get_hostname();
             client_info["image_url"] = url;
+            client_info["startup_sound"] = enable_startup_sound;
             json::Value client_info_msg;
             client_info_msg["client_info"] = std::move(client_info);
             Log(state, "Sending client info: " + client_info_msg.dump());
@@ -623,6 +632,12 @@ int main(int argc, char *argv[]) {
                 if (!sound_str.empty()) {
                   PlaySound(resolve_sound_url(sound_str), state);
                 }
+              } else if (json_message.contains("startup_sound") &&
+                         json_message["startup_sound"].is_boolean()) {
+                enable_startup_sound =
+                    json_message["startup_sound"].get<bool>();
+                Log(state, "Startup sound setting updated to " +
+                               std::to_string(enable_startup_sound));
               } else if (json_message.contains("status") &&
                          json_message["status"].is_string() &&
                          json_message.contains("message") &&
