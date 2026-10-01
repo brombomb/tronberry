@@ -77,7 +77,10 @@ apply_flicker_fixes
 
 # Parse optional username argument
 TARGET_USER=${1:-$(whoami)}
-HOME_DIR=$(eval echo "~$TARGET_USER")
+HOME_DIR=$(getent passwd "$TARGET_USER" | cut -d: -f6)
+if [ -z "$HOME_DIR" ]; then
+  HOME_DIR="/home/$TARGET_USER"
+fi
 INSTALL_DIR="$HOME_DIR/tronberry"
 
 echo "Using user: $TARGET_USER"
@@ -85,7 +88,7 @@ echo "Install path: $INSTALL_DIR"
 
 echo "Installing required packages..."
 sudo apt update
-sudo apt install -y ca-certificates curl jq libwebp7 libwebpdemux2
+sudo apt install -y ca-certificates curl jq libwebp7 libwebpdemux2 mpv
 
 echo "Installing Tronberry..."
 if [ ! -d "$INSTALL_DIR" ]; then

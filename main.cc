@@ -1,7 +1,9 @@
 #include <webp/decode.h>
 #include <webp/demux.h>
 
+#include <fcntl.h>
 #include <sys/reboot.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -86,6 +88,104 @@ static void Log(const AppState &state, const std::string &message) {
   std::cout << "[" << timebuf << "] " << message << std::endl;
 }
 
+class SoundPlayer {
+ public:
+  SoundPlayer() : worker_([this]() { WorkerLoop(); }) {}
+  ~SoundPlayer() { Stop(); }
+
+  void Play(const std::string &sound_url, const AppState &state) {
+    if (sound_url.empty() || !state.running || stopped_) {
+      return;
+    }
+    Log(state, "Queueing sound: " + sound_url);
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (queue_.size() >= 2) {
+        queue_.pop();
+      }
+      queue_.push(sound_url);
+    }
+    cv_.notify_one();
+  }
+
+  void Stop() {
+    bool expected = false;
+    if (!stopped_.compare_exchange_strong(expected, true)) {
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      while (!queue_.empty()) queue_.pop();
+    }
+    cv_.notify_all();
+    pid_t pid = current_pid_.load();
+    if (pid > 0) {
+      kill(pid, SIGTERM);
+    }
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+ private:
+  void WorkerLoop() {
+    while (!stopped_) {
+      std::string sound_url;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this]() { return stopped_ || !queue_.empty(); });
+        if (stopped_) {
+          break;
+        }
+        sound_url = std::move(queue_.front());
+        queue_.pop();
+      }
+
+      pid_t pid = fork();
+      if (pid < 0) {
+        std::cerr << "Failed to fork for sound playback" << std::endl;
+        continue;
+      }
+      if (pid == 0) {
+        // Child process: redirect stdio to /dev/null
+        int devnull = open("/dev/null", O_RDWR);
+        if (devnull >= 0) {
+          dup2(devnull, STDIN_FILENO);
+          dup2(devnull, STDOUT_FILENO);
+          dup2(devnull, STDERR_FILENO);
+          if (devnull > STDERR_FILENO) {
+            close(devnull);
+          }
+        }
+        execlp("mpv", "mpv", "--no-video", "--really-quiet", sound_url.c_str(),
+               static_cast<char *>(nullptr));
+        execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
+               sound_url.c_str(), static_cast<char *>(nullptr));
+        execlp("aplay", "aplay", "-q", sound_url.c_str(),
+               static_cast<char *>(nullptr));
+        _exit(127);
+      }
+
+      current_pid_ = pid;
+      int status = 0;
+      waitpid(pid, &status, 0);
+      current_pid_ = -1;
+      if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+        std::cerr << "Sound player not found (install mpv or ffplay)" << std::endl;
+      }
+    }
+  }
+
+  std::queue<std::string> queue_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::atomic<bool> stopped_{false};
+  std::atomic<pid_t> current_pid_{-1};
+  std::thread worker_;
+};
+
+static SoundPlayer *g_sound_player = nullptr;
+
 static void InterruptHandler(int) {
   // Only the atomic store is strictly signal-safe. The notify_all calls on
   // condition variables are technically undefined behavior in a signal handler,
@@ -95,6 +195,15 @@ static void InterruptHandler(int) {
     g_app_state->running = false;
     g_app_state->queue_not_empty.notify_all();
     g_app_state->queue_not_full.notify_all();
+  }
+  if (g_sound_player) {
+    g_sound_player->Stop();
+  }
+}
+
+static void PlaySound(const std::string &sound_url, const AppState &state) {
+  if (g_sound_player) {
+    g_sound_player->Play(sound_url, state);
   }
 }
 
@@ -287,6 +396,8 @@ static int usage(const char *progname, const char *msg = NULL) {
 int main(int argc, char *argv[]) {
   AppState state;
   g_app_state = &state;
+  SoundPlayer sound_player;
+  g_sound_player = &sound_player;
 
   RGBMatrix::Options matrix_options;
   matrix_options.rows = 32;
@@ -341,6 +452,25 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
+  auto path_start = url.find('/', scheme_end + 3);
+  std::string host_port = url.substr(
+      scheme_end + 3,
+      path_start != std::string::npos ? (path_start - (scheme_end + 3))
+                                      : std::string::npos);
+  std::string http_base_url =
+      (scheme == "wss" ? "https://" : "http://") + host_port;
+
+  auto resolve_sound_url = [&](const std::string &sound) -> std::string {
+    if (sound.empty()) return "";
+    if (sound.rfind("http://", 0) == 0 || sound.rfind("https://", 0) == 0) {
+      return sound;
+    }
+    if (sound.front() == '/') {
+      return http_base_url + sound;
+    }
+    return http_base_url + "/" + sound;
+  };
+
   static std::atomic<int> next_dwell_secs(0);
   static std::atomic<int> ws_message_counter(0);
   static std::atomic<int> immediate_requests(0);
@@ -363,6 +493,7 @@ int main(int argc, char *argv[]) {
     int brightness;
     int dwell_secs;
     int counter = 0;
+    std::string sound_url;
   };
   std::deque<ResponseData> response_queue;
   const size_t max_queue_size = use_websocket ? 3 : 1;
@@ -372,7 +503,7 @@ int main(int argc, char *argv[]) {
   ResponseData startup_response = {
       std::string(reinterpret_cast<const char *>(STARTUP_WEBP),
                   STARTUP_WEBP_LEN),
-      INITIAL_BRIGHTNESS, use_websocket ? 0 : INITIAL_DWELL_SECS, 0};
+      INITIAL_BRIGHTNESS, use_websocket ? 0 : INITIAL_DWELL_SECS, 0, ""};
   response_queue.push_back(std::move(startup_response));
 
   std::thread fetch_thread;
@@ -425,7 +556,7 @@ int main(int argc, char *argv[]) {
               Log(state, "Received image of size " +
                              std::to_string(msg.data.size()) + " bytes");
               ResponseData response = {
-                  msg.data, -1, next_dwell_secs.load(), 0};
+                  msg.data, -1, next_dwell_secs.load(), 0, ""};
               add_to_queue(std::move(response));
             } else {
               auto json_message = json::Value::parse(msg.data);
@@ -474,8 +605,16 @@ int main(int argc, char *argv[]) {
                 if (json_message["reboot"].get<bool>()) {
                   Log(state, "Reboot requested via WebSocket");
                   std::cerr << "Rebooting..." << std::endl;
+                  sound_player.Stop();
                   sync();
                   reboot(RB_AUTOBOOT);
+                }
+              } else if (json_message.contains("sound") &&
+                         json_message["sound"].is_string()) {
+                std::string sound_str =
+                    json_message["sound"].get<std::string>();
+                if (!sound_str.empty()) {
+                  PlaySound(resolve_sound_url(sound_str), state);
                 }
               } else if (json_message.contains("status") &&
                          json_message["status"].is_string() &&
@@ -564,6 +703,11 @@ int main(int argc, char *argv[]) {
           response.dwell_secs = 0;
         }
 
+        auto sound_hdr = res->get_header_value("Tronbyt-Sound", "");
+        if (!sound_hdr.empty()) {
+          response.sound_url = resolve_sound_url(sound_hdr);
+        }
+
         add_to_queue(std::move(response));
       }
     });
@@ -602,6 +746,10 @@ int main(int argc, char *argv[]) {
     }
 
     matrix->SetBrightness(state.brightness.load());
+
+    if (!response.sound_url.empty()) {
+      PlaySound(response.sound_url, state);
+    }
 
     if (response.data.empty()) {
       continue;
@@ -675,12 +823,14 @@ int main(int argc, char *argv[]) {
   }
 
   Log(state, "Shutting down...");
+  sound_player.Stop();
   if (ws_client) {
     ws_client->stop();
   } else {
     fetch_thread.join();
   }
 
+  g_sound_player = nullptr;
   g_app_state = nullptr;
   return 0;
 }
