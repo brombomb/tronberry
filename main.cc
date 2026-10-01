@@ -386,7 +386,7 @@ static int usage(const char *progname, const char *msg = NULL) {
     std::cerr << msg << std::endl;
   }
   std::cerr << "Fetch images over HTTP and display on RGB-Matrix" << std::endl;
-  std::cerr << "usage: " << progname << " <URL>" << std::endl;
+  std::cerr << "usage: " << progname << " <URL> [--verbose] [--no-startup-sound]" << std::endl;
 
   std::cerr << "\nGeneral LED matrix options:" << std::endl;
   PrintMatrixFlags(stderr);
@@ -411,10 +411,15 @@ int main(int argc, char *argv[]) {
   runtime_options.gpio_slowdown = 2;
   runtime_options.drop_privileges = true;
 
+  bool enable_startup_sound = true;
   std::vector<char *> new_argv(argv, argv + argc);
   for (auto it = new_argv.begin() + 1; it != new_argv.end();) {
     if (strcmp(*it, "--verbose") == 0) {
       state.verbose = true;
+      it = new_argv.erase(it);
+    } else if (strcmp(*it, "--no-sound") == 0 ||
+               strcmp(*it, "--no-startup-sound") == 0) {
+      enable_startup_sound = false;
       it = new_argv.erase(it);
     } else {
       ++it;
@@ -500,10 +505,12 @@ int main(int argc, char *argv[]) {
   std::atomic<bool> startup_animation_playing(true);
 
   // Display the startup image
+  std::string startup_sound = enable_startup_sound ? GetStartupSoundPath() : "";
   ResponseData startup_response = {
       std::string(reinterpret_cast<const char *>(STARTUP_WEBP),
                   STARTUP_WEBP_LEN),
-      INITIAL_BRIGHTNESS, use_websocket ? 0 : INITIAL_DWELL_SECS, 0, ""};
+      INITIAL_BRIGHTNESS, use_websocket ? 0 : INITIAL_DWELL_SECS, 0,
+      startup_sound};
   response_queue.push_back(std::move(startup_response));
 
   std::thread fetch_thread;
