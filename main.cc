@@ -88,24 +88,35 @@ static void Log(const AppState &state, const std::string &message) {
   std::cout << "[" << timebuf << "] " << message << std::endl;
 }
 
+struct SoundRequest {
+  std::string url;
+  int volume{100};
+};
+
 class SoundPlayer {
  public:
   SoundPlayer() : worker_([this]() { WorkerLoop(); }) {}
   ~SoundPlayer() { Stop(); }
 
-  void Play(const std::string &sound_url, const AppState &state) {
+  void Play(const std::string &sound_url, int volume, const AppState &state) {
     if (sound_url.empty() || !state.running || stopped_) {
       return;
     }
-    Log(state, "Queueing sound: " + sound_url);
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    Log(state, "Queueing sound: " + sound_url + " (vol " + std::to_string(volume) + "%)");
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (queue_.size() >= 2) {
         queue_.pop();
       }
-      queue_.push(sound_url);
+      queue_.push({sound_url, volume});
     }
     cv_.notify_one();
+  }
+
+  void Play(const std::string &sound_url, const AppState &state) {
+    Play(sound_url, 100, state);
   }
 
   void Stop() {
@@ -130,14 +141,14 @@ class SoundPlayer {
  private:
   void WorkerLoop() {
     while (!stopped_) {
-      std::string sound_url;
+      SoundRequest req;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this]() { return stopped_ || !queue_.empty(); });
         if (stopped_) {
           break;
         }
-        sound_url = std::move(queue_.front());
+        req = std::move(queue_.front());
         queue_.pop();
       }
 
@@ -157,11 +168,14 @@ class SoundPlayer {
             close(devnull);
           }
         }
-        execlp("mpv", "mpv", "--no-video", "--really-quiet", sound_url.c_str(),
-               static_cast<char *>(nullptr));
+        std::string mpv_vol = "--volume=" + std::to_string(req.volume);
+        std::string ffplay_vol = std::to_string(req.volume);
+        execlp("mpv", "mpv", "--no-video", "--really-quiet", mpv_vol.c_str(),
+               req.url.c_str(), static_cast<char *>(nullptr));
         execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-               sound_url.c_str(), static_cast<char *>(nullptr));
-        execlp("aplay", "aplay", "-q", sound_url.c_str(),
+               "-volume", ffplay_vol.c_str(), req.url.c_str(),
+               static_cast<char *>(nullptr));
+        execlp("aplay", "aplay", "-q", req.url.c_str(),
                static_cast<char *>(nullptr));
         _exit(127);
       }
@@ -176,7 +190,7 @@ class SoundPlayer {
     }
   }
 
-  std::queue<std::string> queue_;
+  std::queue<SoundRequest> queue_;
   std::mutex mutex_;
   std::condition_variable cv_;
   std::atomic<bool> stopped_{false};
@@ -201,9 +215,10 @@ static void InterruptHandler(int) {
   }
 }
 
-static void PlaySound(const std::string &sound_url, const AppState &state) {
+static void PlaySound(const std::string &sound_url, int volume,
+                      const AppState &state) {
   if (g_sound_player) {
-    g_sound_player->Play(sound_url, state);
+    g_sound_player->Play(sound_url, volume, state);
   }
 }
 
@@ -386,7 +401,7 @@ static int usage(const char *progname, const char *msg = NULL) {
     std::cerr << msg << std::endl;
   }
   std::cerr << "Fetch images over HTTP and display on RGB-Matrix" << std::endl;
-  std::cerr << "usage: " << progname << " <URL> [--verbose] [--no-startup-sound]" << std::endl;
+  std::cerr << "usage: " << progname << " <URL> [--verbose] [--no-startup-sound] [--volume <0-100>]" << std::endl;
 
   std::cerr << "\nGeneral LED matrix options:" << std::endl;
   PrintMatrixFlags(stderr);
@@ -411,6 +426,11 @@ int main(int argc, char *argv[]) {
   runtime_options.gpio_slowdown = 2;
   runtime_options.drop_privileges = true;
 
+  int default_volume = 100;
+  if (const char *env = getenv("TRONBERRY_VOLUME"); env && *env) {
+    default_volume = std::atoi(env);
+  }
+
   bool enable_startup_sound = true;
   if (const char *env = getenv("TRONBERRY_NO_STARTUP_SOUND");
       env && *env && strcmp(env, "0") != 0) {
@@ -429,10 +449,18 @@ int main(int argc, char *argv[]) {
                strcmp(*it, "--no-startup-sound") == 0) {
       enable_startup_sound = false;
       it = new_argv.erase(it);
+    } else if (strncmp(*it, "--volume=", 9) == 0) {
+      default_volume = std::atoi(*it + 9);
+      it = new_argv.erase(it);
+    } else if (strcmp(*it, "--volume") == 0 && (it + 1) != new_argv.end()) {
+      default_volume = std::atoi(*(it + 1));
+      it = new_argv.erase(it, it + 2);
     } else {
       ++it;
     }
   }
+  if (default_volume < 0) default_volume = 0;
+  if (default_volume > 100) default_volume = 100;
   argc = new_argv.size();
   argv = new_argv.data();
 
@@ -629,8 +657,13 @@ int main(int argc, char *argv[]) {
                          json_message["sound"].is_string()) {
                 std::string sound_str =
                     json_message["sound"].get<std::string>();
+                int volume = default_volume;
+                if (json_message.contains("volume") &&
+                    json_message["volume"].is_number_integer()) {
+                  volume = json_message["volume"].get<int>();
+                }
                 if (!sound_str.empty()) {
-                  PlaySound(resolve_sound_url(sound_str), state);
+                  PlaySound(resolve_sound_url(sound_str), volume, state);
                 }
               } else if (json_message.contains("startup_sound") &&
                          json_message["startup_sound"].is_boolean()) {
@@ -770,7 +803,7 @@ int main(int argc, char *argv[]) {
     matrix->SetBrightness(state.brightness.load());
 
     if (!response.sound_url.empty()) {
-      PlaySound(response.sound_url, state);
+      PlaySound(response.sound_url, default_volume, state);
     }
 
     if (response.data.empty()) {
