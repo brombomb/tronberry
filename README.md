@@ -59,6 +59,11 @@ sudo ./tronberry ${TRONBYT_URL}
 
 If you use `tronberry` with the original Tidbyt display, add the `--led-panel-type=FM6126A` flag. For a list of available options, run `./tronberry --help`, there are many knobs to tweak.
 
+### Panel & Color Configuration
+- **Tidbyt Gen 1 Panels:** Add `--led-panel-type=FM6126A`.
+- **Swapped Colors (Blue showing as Green):** Many HUB75 matrix panels have the Green and Blue channel lines reversed. Add `--led-rgb-sequence=RBG` (or `--led-swap-green-blue`) to correct this. Other sequences like `BGR`, `GRB`, `GBR`, etc. are also supported.
+- **Slowdown GPIO:** If you observe glitches or horizontal line flickering, adjust `--led-slowdown-gpio=4` (Pi Zero 2W / Pi 3 / Pi 4).
+
 ## Sound Notifications & Audio Configuration
 
 Tronberry supports sound notifications and chimes played through a connected speaker.
