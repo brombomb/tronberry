@@ -170,8 +170,8 @@ class SoundPlayer {
         }
         std::string mpv_vol = "--volume=" + std::to_string(req.volume);
         std::string ffplay_vol = std::to_string(req.volume);
-        execlp("mpv", "mpv", "--no-video", "--really-quiet", mpv_vol.c_str(),
-               req.url.c_str(), static_cast<char *>(nullptr));
+        execlp("mpv", "mpv", "--ao=alsa", "--no-video", "--really-quiet",
+               mpv_vol.c_str(), req.url.c_str(), static_cast<char *>(nullptr));
         execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
                "-volume", ffplay_vol.c_str(), req.url.c_str(),
                static_cast<char *>(nullptr));
@@ -424,11 +424,11 @@ int main(int argc, char *argv[]) {
 
   RuntimeOptions runtime_options;
   runtime_options.gpio_slowdown = 2;
-  runtime_options.drop_privileges = true;
+  runtime_options.drop_privileges = 0;  // Keep root privileges by default so audio devices (/dev/snd/*) remain accessible
 
-  int default_volume = 100;
+  int init_volume = 100;
   if (const char *env = getenv("TRONBERRY_VOLUME"); env && *env) {
-    default_volume = std::atoi(env);
+    init_volume = std::atoi(env);
   }
 
   bool enable_startup_sound = true;
@@ -450,17 +450,18 @@ int main(int argc, char *argv[]) {
       enable_startup_sound = false;
       it = new_argv.erase(it);
     } else if (strncmp(*it, "--volume=", 9) == 0) {
-      default_volume = std::atoi(*it + 9);
+      init_volume = std::atoi(*it + 9);
       it = new_argv.erase(it);
     } else if (strcmp(*it, "--volume") == 0 && (it + 1) != new_argv.end()) {
-      default_volume = std::atoi(*(it + 1));
+      init_volume = std::atoi(*(it + 1));
       it = new_argv.erase(it, it + 2);
     } else {
       ++it;
     }
   }
-  if (default_volume < 0) default_volume = 0;
-  if (default_volume > 100) default_volume = 100;
+  if (init_volume < 0) init_volume = 0;
+  if (init_volume > 100) init_volume = 100;
+  std::atomic<int> default_volume{init_volume};
   argc = new_argv.size();
   argv = new_argv.data();
 
@@ -535,6 +536,7 @@ int main(int argc, char *argv[]) {
     int dwell_secs;
     int counter = 0;
     std::string sound_url;
+    int volume = -1;
   };
   std::deque<ResponseData> response_queue;
   const size_t max_queue_size = use_websocket ? 3 : 1;
@@ -546,7 +548,7 @@ int main(int argc, char *argv[]) {
       std::string(reinterpret_cast<const char *>(STARTUP_WEBP),
                   STARTUP_WEBP_LEN),
       INITIAL_BRIGHTNESS, use_websocket ? 0 : INITIAL_DWELL_SECS, 0,
-      startup_sound};
+      startup_sound, default_volume.load()};
   response_queue.push_back(std::move(startup_response));
 
   std::thread fetch_thread;
@@ -657,14 +659,25 @@ int main(int argc, char *argv[]) {
                          json_message["sound"].is_string()) {
                 std::string sound_str =
                     json_message["sound"].get<std::string>();
-                int volume = default_volume;
+                int volume = default_volume.load();
                 if (json_message.contains("volume") &&
                     json_message["volume"].is_number_integer()) {
                   volume = json_message["volume"].get<int>();
+                  if (volume < 0) volume = 0;
+                  if (volume > 100) volume = 100;
+                  default_volume.store(volume);
                 }
                 if (!sound_str.empty()) {
                   PlaySound(resolve_sound_url(sound_str), volume, state);
                 }
+              } else if (json_message.contains("volume") &&
+                         json_message["volume"].is_number_integer()) {
+                int vol = json_message["volume"].get<int>();
+                if (vol < 0) vol = 0;
+                if (vol > 100) vol = 100;
+                default_volume.store(vol);
+                Log(state, "Default volume updated via WebSocket to " +
+                               std::to_string(vol) + "%");
               } else if (json_message.contains("startup_sound") &&
                          json_message["startup_sound"].is_boolean()) {
                 enable_startup_sound =
@@ -763,6 +776,16 @@ int main(int argc, char *argv[]) {
           response.sound_url = resolve_sound_url(sound_hdr);
         }
 
+        auto volume_hdr = res->get_header_value("Tronbyt-Volume", "");
+        if (!volume_hdr.empty()) {
+          end_ptr = nullptr;
+          long v = std::strtol(volume_hdr.c_str(), &end_ptr, 10);
+          if (*end_ptr == '\0' && v >= 0 && v <= 100) {
+            response.volume = static_cast<int>(v);
+            default_volume.store(response.volume);
+          }
+        }
+
         add_to_queue(std::move(response));
       }
     });
@@ -803,7 +826,8 @@ int main(int argc, char *argv[]) {
     matrix->SetBrightness(state.brightness.load());
 
     if (!response.sound_url.empty()) {
-      PlaySound(response.sound_url, default_volume, state);
+      int vol = response.volume >= 0 ? response.volume : default_volume.load();
+      PlaySound(response.sound_url, vol, state);
     }
 
     if (response.data.empty()) {
