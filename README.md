@@ -112,4 +112,4 @@ In your Tronbyt Server web dashboard:
 1. **Device Type:** Configure your device as a speaker-capable device type: **Raspberry Pi**, **Raspberry Pi Wide**, or **Raspberry Pi Square** (do *not* use Tidbyt Gen 1, which has no audio capability on the server).
 2. **Endpoint URL:** Use `ws://<server>:<port>/<device-id>/ws` for WebSocket mode (recommended: supports instant image pushes, dynamic volume adjustments, immediate animations, and real-time sounds), or `http://<server>:<port>/<device-id>/next` for HTTP polling.
 3. **Volume & Sound Testing:** In the device settings, you can adjust the **Speaker Volume** slider (0–100%) and use the **Play on Device** test button to verify audio output.
-4. **App Notifications:** Installed apps with notification sounds configured will chime automatically on render or content update.
+4. **App Notifications:** Installed apps with notification sounds configured will chime automatically on display rotation (`every_display`) or content changes (`on_change`).
