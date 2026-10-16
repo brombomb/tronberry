@@ -229,7 +229,14 @@ static std::string get_self_executable_path() {
   ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
   if (len > 0) {
     buf[len] = '\0';
-    return std::string(buf);
+    std::string path(buf);
+    const std::string deleted_suffix = " (deleted)";
+    if (path.size() >= deleted_suffix.size() &&
+        path.compare(path.size() - deleted_suffix.size(),
+                     deleted_suffix.size(), deleted_suffix) == 0) {
+      path.erase(path.size() - deleted_suffix.size());
+    }
+    return path;
   }
   return "";
 }
