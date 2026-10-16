@@ -110,6 +110,13 @@ sudo alsactl store
 ### Pairing with Tronbyt Server
 In your Tronbyt Server web dashboard:
 1. **Device Type:** Configure your device as a speaker-capable device type: **Raspberry Pi**, **Raspberry Pi Wide**, or **Raspberry Pi Square** (do *not* use Tidbyt Gen 1, which has no audio capability on the server).
-2. **Endpoint URL:** Use `ws://<server>:<port>/<device-id>/ws` for WebSocket mode (recommended: supports instant image pushes, dynamic volume adjustments, immediate animations, and real-time sounds), or `http://<server>:<port>/<device-id>/next` for HTTP polling.
+2. **Endpoint URL:** Use `ws://<server>:<port>/<device-id>/ws` for WebSocket mode (recommended: supports instant image pushes, dynamic volume adjustments, immediate animations, real-time sounds, and instant OTA triggers), or `http://<server>:<port>/<device-id>/next` for HTTP polling.
 3. **Volume & Sound Testing:** In the device settings, you can adjust the **Speaker Volume** slider (0–100%) and use the **Play on Device** test button to verify audio output.
 4. **App Notifications:** Installed apps with notification sounds configured will chime automatically on display rotation (`every_display`) or content changes (`on_change`).
+
+## Over-The-Air (OTA) Firmware Updates
+
+Tronberry supports seamless managed firmware updates through the Tronbyt Server web UI:
+- **Server UI Management:** In Tronbyt Server under **Device Settings -> Maintenance**, select the desired firmware release from the dropdown or upload a custom `tronberry` binary.
+- **Automated Replacement:** When triggered, Tronberry receives the download URL via WebSocket (`{"ota_url": "..."}`) or HTTP response header (`Tronbyt-OTA-URL: ...`). It fetches the binary, verifies the ELF binary magic (`\x7fELF`), writes to `<binary>.new`, and atomically replaces the running binary on disk via POSIX `rename()`.
+- **Zero-Downtime Restart:** Once replaced, Tronberry cleanly releases display and audio hardware and exits with code 0. The `systemd` service (`Restart=always`) automatically restarts Tronberry with the new version in under 1 second without needing a full system reboot.

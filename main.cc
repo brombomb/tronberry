@@ -2,7 +2,9 @@
 #include <webp/demux.h>
 
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/reboot.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -220,6 +222,149 @@ static void PlaySound(const std::string &sound_url, int volume,
   if (g_sound_player) {
     g_sound_player->Play(sound_url, volume, state);
   }
+}
+
+static std::string get_self_executable_path() {
+  char buf[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+  if (len > 0) {
+    buf[len] = '\0';
+    return std::string(buf);
+  }
+  return "";
+}
+
+static bool FetchURL(std::string current_url, std::string &out_data,
+                     int max_redirects = 5) {
+  for (int redirect = 0; redirect < max_redirects; ++redirect) {
+    size_t scheme_end = current_url.find("://");
+    if (scheme_end == std::string::npos) return false;
+    auto path_start = current_url.find('/', scheme_end + 3);
+    std::string base_url = current_url.substr(
+        0, path_start != std::string::npos ? path_start : current_url.length());
+    std::string path =
+        path_start != std::string::npos ? current_url.substr(path_start) : "/";
+
+    http::Client client(base_url);
+    if (!client.is_valid()) return false;
+    client.set_connection_timeout(30);
+    client.set_read_timeout(60);
+    client.set_default_headers({
+        {"User-Agent", "Tronberry-Updater/1.0"},
+        {"Accept", "application/octet-stream, */*"},
+    });
+
+    auto res = client.Get(path.c_str());
+    if (!res) return false;
+
+    if (res->status >= 300 && res->status < 400) {
+      std::string loc = res->get_header_value("location");
+      if (loc.empty()) return false;
+      if (loc.rfind("http://", 0) == 0 || loc.rfind("https://", 0) == 0) {
+        current_url = loc;
+      } else if (loc.front() == '/') {
+        current_url = base_url + loc;
+      } else {
+        current_url = base_url + "/" + loc;
+      }
+      continue;
+    }
+
+    if (res->status == 200) {
+      out_data = std::move(res->body);
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+static std::atomic<bool> g_update_in_progress{false};
+
+static void PerformSelfUpdate(const std::string &ota_url, AppState &state) {
+  bool expected = false;
+  if (!g_update_in_progress.compare_exchange_strong(expected, true)) {
+    Log(state, "Self-update already in progress, ignoring duplicate request");
+    return;
+  }
+
+  Log(state, "Starting self-update from URL: " + ota_url);
+  std::string self_path = get_self_executable_path();
+  if (self_path.empty()) {
+    std::cerr << "Self-update failed: unable to determine running binary path from /proc/self/exe"
+              << std::endl;
+    g_update_in_progress = false;
+    return;
+  }
+  Log(state, "Target binary path: " + self_path);
+
+  std::string binary_data;
+  if (!FetchURL(ota_url, binary_data)) {
+    std::cerr << "Self-update failed: could not download binary from " << ota_url
+              << std::endl;
+    g_update_in_progress = false;
+    return;
+  }
+
+  // Validate ELF magic: \x7f E L F
+  if (binary_data.size() < 1024 ||
+      static_cast<uint8_t>(binary_data[0]) != 0x7f ||
+      binary_data[1] != 'E' || binary_data[2] != 'L' ||
+      binary_data[3] != 'F') {
+    std::cerr << "Self-update failed: downloaded data is not a valid ELF binary (size="
+              << binary_data.size() << ")" << std::endl;
+    g_update_in_progress = false;
+    return;
+  }
+
+  std::string temp_path = self_path + ".new";
+  {
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      std::cerr << "Self-update failed: cannot open temp file " << temp_path
+                << ": " << strerror(errno) << std::endl;
+      g_update_in_progress = false;
+      return;
+    }
+    out.write(binary_data.data(), binary_data.size());
+    out.flush();
+    if (!out.good()) {
+      std::cerr << "Self-update failed: error writing to " << temp_path
+                << std::endl;
+      unlink(temp_path.c_str());
+      g_update_in_progress = false;
+      return;
+    }
+  }
+
+  if (chmod(temp_path.c_str(), 0755) != 0) {
+    std::cerr << "Self-update failed: chmod on " << temp_path
+              << " failed: " << strerror(errno) << std::endl;
+    unlink(temp_path.c_str());
+    g_update_in_progress = false;
+    return;
+  }
+
+  if (rename(temp_path.c_str(), self_path.c_str()) != 0) {
+    std::cerr << "Self-update failed: rename " << temp_path << " to "
+              << self_path << " failed: " << strerror(errno) << std::endl;
+    unlink(temp_path.c_str());
+    g_update_in_progress = false;
+    return;
+  }
+
+  sync();
+  Log(state, "Self-update successful (" + std::to_string(binary_data.size()) +
+                 " bytes). Exiting for restart...");
+  std::cerr << "Self-update installed successfully. Exiting for restart."
+            << std::endl;
+
+  if (g_sound_player) {
+    g_sound_player->Stop();
+  }
+  state.running = false;
+  state.queue_not_empty.notify_all();
+  state.queue_not_full.notify_all();
 }
 
 static void DrawFrame(FrameCanvas *canvas, const uint8_t *frame_data, int width,
@@ -646,6 +791,16 @@ int main(int argc, char *argv[]) {
                   state.queue_not_full.notify_all();
                   immediate_requests++;
                 }
+              } else if (json_message.contains("ota_url") &&
+                         json_message["ota_url"].is_string()) {
+                std::string ota_url =
+                    resolve_sound_url(json_message["ota_url"].get<std::string>());
+                Log(state, "OTA update requested via WebSocket: " + ota_url);
+                if (!ota_url.empty()) {
+                  std::thread([ota_url, &state]() {
+                    PerformSelfUpdate(ota_url, state);
+                  }).detach();
+                }
               } else if (json_message.contains("reboot") &&
                          json_message["reboot"].is_boolean()) {
                 if (json_message["reboot"].get<bool>()) {
@@ -784,6 +939,26 @@ int main(int argc, char *argv[]) {
             response.volume = static_cast<int>(v);
             default_volume.store(response.volume);
           }
+        }
+
+        auto ota_hdr = res->get_header_value("Tronbyt-OTA-URL", "");
+        if (!ota_hdr.empty()) {
+          std::string ota_url = resolve_sound_url(ota_hdr);
+          Log(state, "OTA update requested via HTTP header: " + ota_url);
+          if (!ota_url.empty()) {
+            std::thread([ota_url, &state]() {
+              PerformSelfUpdate(ota_url, state);
+            }).detach();
+          }
+        }
+
+        auto reboot_hdr = res->get_header_value("Tronbyt-Reboot", "");
+        if (!reboot_hdr.empty() && (reboot_hdr == "true" || reboot_hdr == "1")) {
+          Log(state, "Reboot requested via HTTP header");
+          std::cerr << "Rebooting..." << std::endl;
+          sound_player.Stop();
+          sync();
+          reboot(RB_AUTOBOOT);
         }
 
         add_to_queue(std::move(response));
